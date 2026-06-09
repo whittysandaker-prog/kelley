@@ -1,22 +1,20 @@
-# ASAM Wars — Per-Tab Participant Identity & Simplified Join
+# ASAM Wars — Per-Tab Participant Identity & Simplified Join (FINAL, drop-in)
 
-This fixes the bug where two tabs in the same browser shared one
-`localStorage` participant token and were treated as the same player.
+Fixes the bug where two tabs in the same browser shared one `localStorage`
+participant token and were treated as the same player.
 
 Scope: participant identity + join/lobby flow **only**. No changes to
 scoring, the Supabase schema, or the chart viewer.
 
+The fix: team identity lives in **`sessionStorage`** (per-tab, so two tabs =
+two players automatically), with a **`?pt=`** URL override to pin an exact
+identity for testing. Solo play keeps its stable `localStorage` identity.
+
 ---
 
-## 1. Token resolution — `lib/asam.ts`
+## FILE 1 — `lib/asam.ts`
 
-Replace the old `localParticipantToken()` with the version below. It adds a
-`perTab` option:
-
-- **Team play** (`perTab: true`): `?pt=` URL override → else a per-tab
-  `sessionStorage` token. Two tabs in one browser get two identities.
-- **Solo play** (`perTab: false`, the default): one stable `localStorage`
-  identity per device — existing single-player behaviour is preserved.
+Replace the old `localParticipantToken()` with this.
 
 ```ts
 const PT_KEY = "asam_participant_token";
@@ -76,45 +74,35 @@ export function localParticipantToken(opts: { perTab?: boolean } = {}): string {
 }
 ```
 
-Why `sessionStorage` solves the bug: `localStorage` is shared by every tab
-of an origin; `sessionStorage` is scoped to a single tab. So a second tab
-automatically gets its own token with zero manual work — and `?pt=` lets you
-pin an exact identity when you want one.
-
 ---
 
-## 2. Resolve the token per-tab in `TeamMode.tsx`
+## FILE 2 — `TeamMode.tsx` (6 edits)
 
-Change the top-of-component resolution so team mode uses the per-tab path.
-`useMemo` keeps it stable across re-renders (and reads `?pt=` exactly once,
-before any Supabase insert):
+### ① Import `useMemo` (top of file)
+
+```ts
+import { useState, useEffect, useRef, useMemo } from "react";
+```
+
+### ② Replace the token line (top of the component)
 
 ```ts
 // was: const token = localParticipantToken();
 const token = useMemo(() => localParticipantToken({ perTab: true }), []);
 ```
 
-Make sure `useMemo` is imported from React.
-
-Because every Supabase insert (`createSession`, `joinSession`, `pickTeam`,
-flags, attempts) and `refetchParticipants()`'s "find me" already use this
-`token`, fixing the token here fixes identity everywhere — including
-requirement 5 (each tab matches its own row by the resolved per-tab token).
-
----
-
-## 3. URL params — read both `?join` and `?pt`
-
-`?pt=` is consumed inside `localParticipantToken()` at mount, so this effect
-only needs to handle `?join`. Setting `autoJoin` lets the join screen skip
-manual code entry (requirement 3) while keeping the typed-code path:
+### ③ Add `autoJoin` state (next to the other join state)
 
 ```ts
 const [autoJoin, setAutoJoin] = useState(false);
+```
 
+### ④ Replace the `?join` useEffect
+
+```ts
 // Read URL params once on mount.
-// ?pt  -> already consumed by localParticipantToken({ perTab: true }) above,
-//         so the per-tab identity is locked in before any insert.
+// ?pt  -> already consumed by localParticipantToken({ perTab: true }),
+//         so per-tab identity is locked in before any Supabase insert.
 // ?join -> auto-resolve the session and drop straight to the name prompt.
 useEffect(() => {
   try {
@@ -129,45 +117,7 @@ useEffect(() => {
 }, []);
 ```
 
----
-
-## 4. `joinSession()` — unchanged logic, now correct identity
-
-Your existing `joinSession()` already auto-assigns the joiner to the team
-with the fewest **real** (non-bot) members, and already keys "me" off
-`token`. With the per-tab `token` from step 2 it now works correctly with no
-further change. The one thing to confirm is the guard at the top so the
-auto-join path can call it as soon as a name exists:
-
-```ts
-const joinSession = async () => {
-  if (!orgCode || !joinCode.trim() || !joinName.trim())
-    return toast.error("Code & name required");
-  // ... rest unchanged ...
-  // existing = currentList.find((p) => p.client_token === token)  // per-tab now
-  // targetTeam = team with fewest non-bot members
-  // insert { ..., client_token: token }
-};
-```
-
----
-
-## 5. Join URL generation — don't bake a shared `pt` into the link
-
-The old line generated a fresh random `pt` on every render and embedded it
-in the shared link:
-
-```ts
-// OLD — buggy: re-randomises each render, and anyone opening the SAME copied
-// link would collide on the SAME pt.
-const joinUrl = session
-  ? `${window.location.origin}${window.location.pathname}?join=${session.code}&pt=tester-${Math.random().toString(36).slice(2,7)}`
-  : "";
-```
-
-Replace it with a **stable** share link that carries no `pt` (each tab then
-self-assigns a per-tab `sessionStorage` identity), plus a helper that mints
-**distinct** forced-identity links for solo testing:
+### ⑤ Replace the `joinUrl` line
 
 ```ts
 // Stable share link — no pt. Every tab/person who opens it self-assigns a
@@ -181,20 +131,14 @@ const joinUrl = useMemo(
 );
 
 // Forced-identity links for solo testing two teams from one machine.
-// Each label pins an exact, distinct token via ?pt=.
 const testerJoinUrl = (label: string) =>
   session ? `${joinUrl}&pt=tester-${label}` : "";
 ```
 
-Then in the Host Test Tools panel, offer two explicit tester links instead of
-one randomised one, e.g. `testerJoinUrl("a")` and `testerJoinUrl("b")`.
+### ⑥ Add the identity banner
 
----
-
-## 6. "You are: [name] on [team]" banner (lobby + round)
-
-Drop this banner near the top of both the `lobby` and `round` renders so each
-tab visibly proves it is a different person:
+Paste near the top of BOTH the `sub === "lobby"` and `sub === "round"`
+returns:
 
 ```tsx
 {me && (
@@ -212,33 +156,55 @@ tab visibly proves it is a different person:
 
 ---
 
+## OPTIONAL — tester buttons for the Host Test Tools panel
+
+Replaces the single randomized link with explicit, distinct tester links.
+
+```tsx
+<div className="flex gap-2 flex-wrap">
+  {["a", "b", "c"].map((label) => (
+    <Button
+      key={label}
+      variant="outline"
+      size="sm"
+      onClick={() => { navigator.clipboard.writeText(testerJoinUrl(label)); toast.success(`Copied tester-${label} link`); }}
+    >
+      <Copy className="w-3 h-3 mr-1" /> Tester {label.toUpperCase()} link
+    </Button>
+  ))}
+</div>
+```
+
+---
+
+## No edits needed
+
+`joinSession()` and `refetchParticipants()` already key "me" off `token` and
+already auto-assign joiners to the team with the fewest non-bot members. Once
+`token` is per-tab (edit ②), they are correct as-is — this also satisfies the
+"each tab matches its own row" requirement.
+
+---
+
 ## How to test two teams from one machine
 
-The session token now lives in `sessionStorage`, which is per-tab. You have
-two ways to get distinct players:
-
 **Easiest — separate windows (auto identity):**
-1. Host: Quick-Start a session, copy the **Join link** (now `?join=CODE`,
-   no `pt`).
-2. Open that link in a **normal window**, an **incognito/private window**,
-   and **another browser** (Chrome + Firefox). Each window is a separate
-   `sessionStorage`, so each becomes a different participant. They auto-assign
-   to the emptiest team and land on the name prompt.
-   - Note: two **tabs of the same normal window** that were opened with
-     "Duplicate tab" can copy `sessionStorage`; opening a fresh tab and
-     pasting the link does not. When in doubt, use separate windows or the
-     `?pt=` links below.
+1. Host: Quick-Start a session, copy the **Join link** (now `?join=CODE`, no `pt`).
+2. Open it in a **normal window**, an **incognito/private window**, and a
+   **second browser** (Chrome + Firefox). Each window is its own
+   `sessionStorage`, so each becomes a different participant, auto-assigned to
+   the emptiest team.
+   - Avoid "Duplicate tab" — it copies `sessionStorage`. Open a fresh window
+     and paste the link instead, or use the `?pt=` links below.
 
 **Most deterministic — forced identities (`?pt=`):**
-1. In Host Test Tools, use the two tester links (`testerJoinUrl("a")`,
-   `testerJoinUrl("b")`), or just append your own:
+1. Use the tester links (`testerJoinUrl("a"/"b"/"c")`), or append by hand:
    - `…?join=ASAM-1234&pt=tester-a`
    - `…?join=ASAM-1234&pt=tester-b`
-   - `…?join=ASAM-1234&pt=tester-c`
-2. Open each in any tab/window — even all in the same browser. `?pt=` pins
-   the exact token, so they are guaranteed distinct regardless of storage.
-3. Give each a name (Alex on Team 1, Sam on Team 2). The first real member of
-   each team becomes its Lead and submits for that team.
+2. Open each in any tab/window — even all in the same browser. `?pt=` pins the
+   exact token, guaranteed distinct regardless of storage.
+3. Name them (Alex on Team 1, Sam on Team 2). The first real member of each
+   team becomes its Lead and submits for that team.
 
-Either way, the "You are: [name] on [team]" banner confirms each tab/window
-is a different person before you start a round.
+The "You are: [name] on [team]" banner confirms each tab/window is a different
+person before you start a round.
